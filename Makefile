@@ -1,6 +1,6 @@
-NAME = simrupt
-obj-m := $(NAME).o
+obj-m := simrupt.o
 
+ccflags-y := -std=gnu99 -Wno-declaration-after-statement
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 

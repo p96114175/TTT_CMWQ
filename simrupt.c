@@ -10,6 +10,36 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
+#include "game.h"
+
+static char chessboard_buffer[BOARD_BUFFER_SIZE];
+char table[N_GRIDS];
+static int build_chessboard(char *table)
+{
+    int i = 0, k = 0;
+    while (i < BOARD_BUFFER_SIZE) {
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
+            if (j & 1) {
+                chessboard_buffer[i++] = '|';
+            } else {
+                chessboard_buffer[i++] = table[k++];
+            }
+            smp_wmb();
+        }
+        chessboard_buffer[i++] = '\n';
+        smp_wmb();
+        for (int j = 1; j < (BOARD_SIZE << 1); j++) {
+            chessboard_buffer[i++] = '-';
+            smp_wmb();
+        }
+        chessboard_buffer[i++] = '\n';
+        smp_wmb();
+    }
+
+
+    return 0;
+}
+
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("A device that simulates interrupts");
@@ -58,14 +88,16 @@ static inline int update_simrupt_data(void)
 }
 
 /* Insert a value into the kfifo buffer */
-static void produce_data(unsigned char val)
+static void produce_chessboard(void)
 {
     /* Implement a kind of circular FIFO here (skip oldest element if kfifo
      * buffer is full).
      */
-    unsigned int len = kfifo_in(&rx_fifo, &val, sizeof(val));
-    if (unlikely(len < sizeof(val)) && printk_ratelimit())
-        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(val) - len);
+    unsigned int len =
+        kfifo_in(&rx_fifo, chessboard_buffer, sizeof(chessboard_buffer));
+    if (unlikely(len < sizeof(chessboard_buffer)) && printk_ratelimit())
+        pr_warn("%s: %zu bytes dropped\n", __func__,
+                sizeof(chessboard_buffer) - len);
 
     pr_debug("simrupt: %s: in %u/%u bytes\n", __func__, len,
              kfifo_len(&rx_fifo));
@@ -84,54 +116,54 @@ static DEFINE_MUTEX(consumer_lock);
  */
 static struct circ_buf fast_buf;
 
-static int fast_buf_get(void)
-{
-    struct circ_buf *ring = &fast_buf;
+// static int fast_buf_get(void)
+// {
+//     struct circ_buf *ring = &fast_buf;
 
-    /* prevent the compiler from merging or refetching accesses for tail */
-    unsigned long head = READ_ONCE(ring->head), tail = ring->tail;
-    int ret;
+//     /* prevent the compiler from merging or refetching accesses for tail */
+//     unsigned long head = READ_ONCE(ring->head), tail = ring->tail;
+//     int ret;
 
-    if (unlikely(!CIRC_CNT(head, tail, PAGE_SIZE)))
-        return -ENOENT;
+//     if (unlikely(!CIRC_CNT(head, tail, PAGE_SIZE)))
+//         return -ENOENT;
 
-    /* read index before reading contents at that index */
-    smp_rmb();
+//     /* read index before reading contents at that index */
+//     smp_rmb();
 
-    /* extract item from the buffer */
-    ret = ring->buf[tail];
+//     /* extract item from the buffer */
+//     ret = ring->buf[tail];
 
-    /* finish reading descriptor before incrementing tail */
-    smp_mb();
+//     /* finish reading descriptor before incrementing tail */
+//     smp_mb();
 
-    /* increment the tail pointer */
-    ring->tail = (tail + 1) & (PAGE_SIZE - 1);
+//     /* increment the tail pointer */
+//     ring->tail = (tail + 1) & (PAGE_SIZE - 1);
 
-    return ret;
-}
+//     return ret;
+// }
 
-static int fast_buf_put(unsigned char val)
-{
-    struct circ_buf *ring = &fast_buf;
-    unsigned long head = ring->head;
+// static int fast_buf_put(unsigned char val)
+// {
+//     struct circ_buf *ring = &fast_buf;
+//     unsigned long head = ring->head;
 
-    /* prevent the compiler from merging or refetching accesses for tail */
-    unsigned long tail = READ_ONCE(ring->tail);
+//     /* prevent the compiler from merging or refetching accesses for tail */
+//     unsigned long tail = READ_ONCE(ring->tail);
 
-    /* is circular buffer full? */
-    if (unlikely(!CIRC_SPACE(head, tail, PAGE_SIZE)))
-        return -ENOMEM;
+//     /* is circular buffer full? */
+//     if (unlikely(!CIRC_SPACE(head, tail, PAGE_SIZE)))
+//         return -ENOMEM;
 
-    ring->buf[ring->head] = val;
+//     ring->buf[ring->head] = val;
 
-    /* commit the item before incrementing the head */
-    smp_wmb();
+//     /* commit the item before incrementing the head */
+//     smp_wmb();
 
-    /* update header pointer */
-    ring->head = (ring->head + 1) & (PAGE_SIZE - 1);
+//     /* update header pointer */
+//     ring->head = (ring->head + 1) & (PAGE_SIZE - 1);
 
-    return 0;
-}
+//     return 0;
+// }
 
 /* Clear all data from the circular buffer fast_buf */
 static void fast_buf_clear(void)
@@ -142,7 +174,7 @@ static void fast_buf_clear(void)
 /* Workqueue handler: executed by a kernel thread */
 static void simrupt_work_func(struct work_struct *w)
 {
-    int val, cpu;
+    int cpu;
 
     /* This code runs from a kernel thread, so softirqs and hard-irqs must
      * be enabled.
@@ -157,20 +189,14 @@ static void simrupt_work_func(struct work_struct *w)
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
 
-    while (1) {
-        /* Consume data from the circular buffer */
-        mutex_lock(&consumer_lock);
-        val = fast_buf_get();
-        mutex_unlock(&consumer_lock);
+    // mutex_lock(&producer_lock);
+    // build_chessboard(table);
+    // mutex_unlock(&producer_lock);
+    // /* Store data to the kfifo buffer */
+    // mutex_lock(&consumer_lock);
+    // produce_chessboard();
+    // mutex_unlock(&consumer_lock);
 
-        if (val < 0)
-            break;
-
-        /* Store data to the kfifo buffer */
-        mutex_lock(&producer_lock);
-        produce_data(val);
-        mutex_unlock(&producer_lock);
-    }
     wake_up_interruptible(&rx_wait);
 }
 
@@ -209,16 +235,16 @@ static void simrupt_tasklet_func(unsigned long __data)
 /* Tasklet for asynchronous bottom-half processing in softirq context */
 static DECLARE_TASKLET_OLD(simrupt_tasklet, simrupt_tasklet_func);
 
-static void process_data(void)
-{
-    WARN_ON_ONCE(!irqs_disabled());
+// static void process_data(void)
+// {
+//     WARN_ON_ONCE(!irqs_disabled());
 
-    pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-    fast_buf_put(update_simrupt_data());
+//     pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
+//     // fast_buf_put(update_simrupt_data());
 
-    pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
-    tasklet_schedule(&simrupt_tasklet);
-}
+//     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
+//     tasklet_schedule(&simrupt_tasklet);
+// }
 
 static void timer_handler(struct timer_list *__timer)
 {
@@ -235,7 +261,13 @@ static void timer_handler(struct timer_list *__timer)
     local_irq_disable();
 
     tv_start = ktime_get();
-    process_data();
+    mutex_lock(&producer_lock);
+    build_chessboard(table);
+    mutex_unlock(&producer_lock);
+    /* Store data to the kfifo buffer */
+    mutex_lock(&consumer_lock);
+    produce_chessboard();
+    mutex_unlock(&consumer_lock);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
