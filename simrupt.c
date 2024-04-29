@@ -11,6 +11,7 @@
 #include <linux/workqueue.h>
 
 #include "game.h"
+#include "negamax.h"
 
 static char chessboard_buffer[BOARD_BUFFER_SIZE];
 char table[N_GRIDS];
@@ -40,6 +41,10 @@ static int build_chessboard(char *table)
     return 0;
 }
 
+/* negamax AI setting*/
+static char turn;
+static int finish;
+
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("A device that simulates interrupts");
@@ -51,7 +56,7 @@ MODULE_DESCRIPTION("A device that simulates interrupts");
 #define DECLARE_TASKLET_OLD(arg1, arg2) DECLARE_TASKLET(arg1, arg2, 0L)
 #endif
 
-#define DEV_NAME "simrupt"
+#define DEV_NAME "ttt_cmwq"
 
 #define NR_SIMRUPT 1
 
@@ -172,7 +177,7 @@ static void fast_buf_clear(void)
 }
 
 /* Workqueue handler: executed by a kernel thread */
-static void simrupt_work_func(struct work_struct *w)
+static void PrintBoard_work_func(struct work_struct *w)
 {
     int cpu;
 
@@ -189,25 +194,93 @@ static void simrupt_work_func(struct work_struct *w)
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
 
-    // mutex_lock(&producer_lock);
-    // build_chessboard(table);
-    // mutex_unlock(&producer_lock);
-    // /* Store data to the kfifo buffer */
-    // mutex_lock(&consumer_lock);
-    // produce_chessboard();
-    // mutex_unlock(&consumer_lock);
+    mutex_lock(&producer_lock);
+    build_chessboard(table);
+    mutex_unlock(&producer_lock);
+    /* Store data to the kfifo buffer */
+    mutex_lock(&consumer_lock);
+    produce_chessboard();
+    mutex_unlock(&consumer_lock);
 
     wake_up_interruptible(&rx_wait);
 }
 
+static void AI1_work_func(struct work_struct *w)
+{
+    int cpu;
+
+    /* This code runs from a kernel thread, so softirqs and hard-irqs must
+     * be enabled.
+     */
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+
+    /* Pretend to simulate access to per-CPU data, disabling preemption
+     * during the pr_info().
+     */
+    cpu = get_cpu();
+    pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
+    put_cpu();
+
+    mutex_lock(&producer_lock);
+    /*Start*/
+
+    int move;
+    WRITE_ONCE(move, negamax_predict(table, 'O').move);
+    smp_mb();
+    if (move != -1) {
+        WRITE_ONCE(table[move], 'O');
+        smp_mb();
+    }
+    WRITE_ONCE(turn, 'A');
+    WRITE_ONCE(finish, 1);
+    smp_mb();
+    /*End*/
+    mutex_unlock(&producer_lock);
+    put_cpu();
+}
+static void AI2_work_func(struct work_struct *w)
+{
+    int cpu;
+
+    /* This code runs from a kernel thread, so softirqs and hard-irqs must
+     * be enabled.
+     */
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+
+    /* Pretend to simulate access to per-CPU data, disabling preemption
+     * during the pr_info().
+     */
+    cpu = get_cpu();
+    pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
+    put_cpu();
+
+    mutex_lock(&producer_lock);
+    /*Start*/
+    int move;
+    WRITE_ONCE(move, negamax_predict(table, 'X').move);
+    smp_mb();
+    if (move != -1) {
+        WRITE_ONCE(table[move], 'X');
+        smp_mb();
+    }
+    WRITE_ONCE(turn, 'B');
+    WRITE_ONCE(finish, 1);
+    smp_mb();
+    /*End*/
+    mutex_unlock(&producer_lock);
+    put_cpu();
+}
 /* Workqueue for asynchronous bottom-half processing */
 static struct workqueue_struct *simrupt_workqueue;
 
 /* Work item: holds a pointer to the function that is going to be executed
  * asynchronously.
  */
-static DECLARE_WORK(work, simrupt_work_func);
-
+static DECLARE_WORK(PrintBoard_work, PrintBoard_work_func);
+static DECLARE_WORK(AI1_work, AI1_work_func);
+static DECLARE_WORK(AI2_work, AI2_work_func);
 /* Tasklet handler.
  *
  * NOTE: different tasklets can run concurrently on different processors, but
@@ -223,7 +296,21 @@ static void simrupt_tasklet_func(unsigned long __data)
     WARN_ON_ONCE(!in_softirq());
 
     tv_start = ktime_get();
-    queue_work(simrupt_workqueue, &work);
+    /* Start */
+    READ_ONCE(finish);
+    READ_ONCE(turn);
+    if (finish && turn == 'A') {
+        WRITE_ONCE(finish, 0);
+        smp_wmb();
+        queue_work(simrupt_workqueue, &AI1_work);
+    } else if (finish && turn == 'B') {
+        WRITE_ONCE(finish, 0);
+        smp_wmb();
+        queue_work(simrupt_workqueue, &AI2_work);
+    }
+    /* Print the chessboard */
+    queue_work(simrupt_workqueue, &PrintBoard_work);
+    /* End */
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -235,16 +322,15 @@ static void simrupt_tasklet_func(unsigned long __data)
 /* Tasklet for asynchronous bottom-half processing in softirq context */
 static DECLARE_TASKLET_OLD(simrupt_tasklet, simrupt_tasklet_func);
 
-// static void process_data(void)
-// {
-//     WARN_ON_ONCE(!irqs_disabled());
+static void Chessboard_ai(void)
+{
+    WARN_ON_ONCE(!irqs_disabled());
 
-//     pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-//     // fast_buf_put(update_simrupt_data());
+    pr_info("simrupt: [CPU#%d] AI play the chessboard\n", smp_processor_id());
+    pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
 
-//     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
-//     tasklet_schedule(&simrupt_tasklet);
-// }
+    tasklet_schedule(&simrupt_tasklet);
+}
 
 static void timer_handler(struct timer_list *__timer)
 {
@@ -261,13 +347,17 @@ static void timer_handler(struct timer_list *__timer)
     local_irq_disable();
 
     tv_start = ktime_get();
-    mutex_lock(&producer_lock);
-    build_chessboard(table);
-    mutex_unlock(&producer_lock);
-    /* Store data to the kfifo buffer */
-    mutex_lock(&consumer_lock);
-    produce_chessboard();
-    mutex_unlock(&consumer_lock);
+    /*Start*/
+    Chessboard_ai();
+    // mutex_lock(&producer_lock);
+    // build_chessboard(table);
+    // mutex_unlock(&producer_lock);
+    // /* Store data to the kfifo buffer */
+    // mutex_lock(&consumer_lock);
+    // produce_chessboard();
+    // mutex_unlock(&consumer_lock);
+
+    /*End*/
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -407,6 +497,9 @@ static int __init simrupt_init(void)
     /* Setup the timer */
     timer_setup(&timer, timer_handler, 0);
     atomic_set(&open_cnt, 0);
+
+    /* negamax AI setting*/
+    negamax_init();
 
     pr_info("simrupt: registered new simrupt device: %d,%d\n", major, 0);
 out:
